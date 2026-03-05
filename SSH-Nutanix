@@ -1,0 +1,156 @@
+# Generic - Nutanix Cluster Health Check via SSH (using Plink)
+# (fully anonymized - no domain, school, location, or specific paths)
+
+$VerbosePreference = "Continue"
+
+Write-Verbose "Starting Nutanix health check script..."
+
+# ────────────────────────────────────────────────
+# Configuration - EDIT THESE AS NEEDED
+# ────────────────────────────────────────────────
+
+# Path to plink.exe
+$plinkPath = "C:\Tools\PuTTY\plink.exe"           # ←←← CHANGE THIS PATH
+
+# Where to save reports (local recommended; network share optional)
+$outputBaseDir = "$env:USERPROFILE\Documents\Nutanix-Health-Checks"
+# Alternative: network share example (uncomment & modify if needed)
+# $outputBaseDir = "\\server\share\Nutanix\Reports"
+
+# Log file will be created in the same folder
+# ────────────────────────────────────────────────
+
+# Create base output folder if missing
+if (!(Test-Path $outputBaseDir -PathType Container)) {
+    Write-Verbose "Creating output directory: $outputBaseDir"
+    New-Item -ItemType Directory -Path $outputBaseDir -Force | Out-Null
+}
+
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$logFile = Join-Path $outputBaseDir "nutanix-health-log_$timestamp.txt"
+
+# Initialize log
+"Nutanix Health Check Script started at $(Get-Date)" | Out-File -FilePath $logFile -Append
+
+# ────────────────────────────────────────────────
+# Get connection details
+# ────────────────────────────────────────────────
+$sshServer   = Read-Host "Enter Nutanix CVM IP or hostname"
+$sshUsername = Read-Host "Enter SSH username (commonly 'nutanix')"
+$sshPassword = Read-Host "Enter SSH password" -AsSecureString
+
+# Convert secure string to plain text (Plink requirement)
+$ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sshPassword)
+$plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr)
+[System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+
+# ────────────────────────────────────────────────
+# Validate plink exists
+# ────────────────────────────────────────────────
+if (!(Test-Path $plinkPath)) {
+    Write-Error "plink.exe not found at: $plinkPath"
+    "ERROR: plink.exe not found at $plinkPath" | Out-File -FilePath $logFile -Append
+    exit
+}
+
+# ────────────────────────────────────────────────
+# Output file for this run
+# ────────────────────────────────────────────────
+$outputFile = Join-Path $outputBaseDir "$sshServer-health-check_$timestamp.txt"
+
+# ────────────────────────────────────────────────
+# Commands to run on the Nutanix CVM
+# ────────────────────────────────────────────────
+$remoteCommands = @"
+ncli cluster status
+ncli host ls
+ncli storagepool ls
+ncli container ls
+ncli disk ls
+ncli alert ls
+cluster status
+ncli network ls
+#ncc health_checks run_all    # Uncomment only if you want full NCC run (can be long/slow)
+ncli cluster version
+ncc --version
+ncli software list software-type=PC
+ncli cluster list
+exit
+"@
+
+# ────────────────────────────────────────────────
+# Execute via Plink
+# ────────────────────────────────────────────────
+$plinkArgs = "-ssh -batch -t -v -pw `"$plainPassword`" $sshUsername@$sshServer"
+
+Write-Verbose "Executing Plink on $sshServer..."
+
+try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = $plinkPath
+    $psi.Arguments              = $plinkArgs
+    $psi.RedirectStandardInput  = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.UseShellExecute        = $false
+    $psi.CreateNoWindow         = $true
+
+    $process = [System.Diagnostics.Process]::Start($psi)
+
+    Write-Verbose "Sending commands..."
+    $process.StandardInput.Write($remoteCommands)
+    $process.StandardInput.Close()
+
+    $output      = $process.StandardOutput.ReadToEnd()
+    $errorOutput = $process.StandardError.ReadToEnd()
+
+    $process.WaitForExit()
+
+    # Log raw results
+    "Plink Exit Code: $($process.ExitCode)"                  | Out-File -FilePath $logFile -Append
+    "───────────────────────────────────────────────"       | Out-File -FilePath $logFile -Append
+    "Standard Output:"                                       | Out-File -FilePath $logFile -Append
+    $output | Out-File -FilePath $logFile -Append
+    "───────────────────────────────────────────────"       | Out-File -FilePath $logFile -Append
+    "Error Output:"                                          | Out-File -FilePath $logFile -Append
+    $errorOutput | Out-File -FilePath $logFile -Append
+
+    # Save clean output if we got something useful
+    if ($output -and $output.Trim()) {
+        Set-Content -Path $outputFile -Value $output -Force -Encoding UTF8
+        Write-Host "Health check saved to: $outputFile" -ForegroundColor Green
+        "Output saved to: $outputFile" | Out-File -FilePath $logFile -Append
+    }
+    else {
+        Write-Warning "No meaningful output received from $sshServer"
+        "WARNING: Empty or no output from $sshServer" | Out-File -FilePath $logFile -Append
+    }
+
+    # Common error detection
+    if ($errorOutput -match "Connection refused|No route|unreachable") {
+        Write-Warning "Connection failed: $sshServer"
+        "Connection refused/unreachable" | Out-File -FilePath $logFile -Append
+    }
+    elseif ($errorOutput -match "denied|failed|incorrect|invalid|authentication") {
+        Write-Warning "Authentication failed for $sshServer"
+        "Authentication failed" | Out-File -FilePath $logFile -Append
+    }
+
+}
+catch {
+    Write-Host "Exception during execution: $_" -ForegroundColor Red
+    "Exception: $_" | Out-File -FilePath $logFile -Append
+}
+finally {
+    if ($process -and !$process.HasExited) {
+        try { $process.Kill() } catch {}
+    }
+
+    "Script completed at $(Get-Date)" | Out-File -FilePath $logFile -Append
+
+    # Clear sensitive data (best effort)
+    $plainPassword = $null
+    [GC]::Collect()
+}
+
+Write-Host "`nFinished. Log file: $logFile" -ForegroundColor Cyan
