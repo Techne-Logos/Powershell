@@ -1,0 +1,183 @@
+# Windex - Main cleanup / maintenance script (generic version)
+
+Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Force
+
+# ------------------------------------------------------------------------------
+# Rejoin Domain / Fix Trust Relationship
+# ------------------------------------------------------------------------------
+
+$computerName = $env:COMPUTERNAME
+$domainName   = (Get-WmiObject Win32_ComputerSystem).Domain
+
+function Test-TrustRelationship {
+    try {
+        $trustTest = Test-ComputerSecureChannel -Server $domainName -Verbose:$false
+        return $trustTest
+    }
+    catch {
+        return $false
+    }
+}
+
+$trustBroken = Test-TrustRelationship
+
+if (-not $trustBroken) {
+    Write-Output "Trust relationship with domain is broken. Attempting repair..."
+    try {
+        Reset-ComputerMachinePassword -Verbose
+        Write-Output "Trust relationship restored."
+    }
+    catch {
+        Write-Output "Error repairing trust relationship: $_"
+    }
+}
+else {
+    Write-Output "Trust relationship is intact."
+}
+
+# ------------------------------------------------------------------------------
+# Old Profile Cleanup (generic retention logic)
+# ------------------------------------------------------------------------------
+
+$RetentionStaff   = 90
+$RetentionRegular = 30
+
+$Profiles = Get-WmiObject Win32_UserProfile | Where-Object { $_.Special -ne $true }
+
+$CurrentDate = Get-Date
+
+foreach ($Profile in $Profiles) {
+    $ProfileName = Split-Path $Profile.LocalPath -Leaf
+
+    # Very simple heuristic — customize thresholds / logic as needed
+    if ($ProfileName -match '^[A-Z]') {
+        $DaysOld = $RetentionStaff
+    }
+    else {
+        $DaysOld = $RetentionRegular
+    }
+
+    $LastUseDate     = $Profile.ConvertToDateTime($Profile.LastUseTime)
+    $DaysSinceLastUse = ($CurrentDate - $LastUseDate).Days
+
+    if ($DaysSinceLastUse -gt $DaysOld -and $DaysSinceLastUse -ge 1) {
+        try {
+            $Profile.Delete()
+            Write-Host "Deleted old profile: $($Profile.LocalPath)  (last used $DaysSinceLastUse days ago)"
+        }
+        catch {
+            Write-Host "Failed to delete $($Profile.LocalPath) : $_"
+        }
+    }
+}
+
+Write-Host "Old profile cleanup finished."
+
+# ------------------------------------------------------------------------------
+# Temporary Files Cleanup
+# ------------------------------------------------------------------------------
+
+Remove-Item -Path "$env:USERPROFILE\AppData\Local\Temp\*"        -Force -Recurse -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\Users\*\AppData\Local\Temp\*"             -Force -Recurse -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\Windows\Temp\*"                           -Force -Recurse -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\Windows\Prefetch\*"                       -Force -Recurse -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\Windows\System32\config\systemprofile\AppData\Local\*.tmp" -Force -Recurse -ErrorAction SilentlyContinue
+
+# ------------------------------------------------------------------------------
+# Disable startup items
+# ------------------------------------------------------------------------------
+
+$startupItems = Get-WmiObject Win32_StartupCommand
+$disabled = @()
+
+foreach ($item in $startupItems) {
+    try {
+        $item.Disable() | Out-Null
+        $disabled += $item.Name
+    }
+    catch {
+        Write-Host "Could not disable startup item $($item.Name): $_"
+    }
+}
+
+if ($disabled.Count -gt 0) {
+    Write-Host "Disabled startup items:"
+    $disabled | ForEach-Object { Write-Host "  - $_" }
+}
+else {
+    Write-Host "No startup items were disabled."
+}
+
+# ------------------------------------------------------------------------------
+# Clear Internet Explorer/Edge browsing data (legacy method)
+# ------------------------------------------------------------------------------
+
+RunDll32.exe InetCpl.cpl,ClearMyTracksByProcess 255
+RunDll32.exe InetCpl.cpl,ClearMyTracksByProcess 2
+RunDll32.exe InetCpl.cpl,ClearMyTracksByProcess 8
+RunDll32.exe InetCpl.cpl,ClearMyTracksByProcess 4351
+
+# ------------------------------------------------------------------------------
+# Remove printers containing specific substring (example: virtual printers)
+# ------------------------------------------------------------------------------
+
+$virtualPrinters = Get-Printer | Where-Object { $_.Name -match "virtual|note|pdf|xps" }
+foreach ($printer in $virtualPrinters) {
+    Remove-Printer -Name $printer.Name -Confirm:$false -Verbose
+}
+
+# ------------------------------------------------------------------------------
+# Stop / disable selected non-critical services (customize list!)
+# ------------------------------------------------------------------------------
+
+$servicesToDisable = @(
+    "Adobe*", "Fax", "Xbl*", "Xbox*"
+)
+
+foreach ($pattern in $servicesToDisable) {
+    Get-Service -DisplayName $pattern -ErrorAction SilentlyContinue |
+        Stop-Service -PassThru -ErrorAction SilentlyContinue |
+        Set-Service -StartupType Disabled -ErrorAction SilentlyContinue
+}
+
+# ------------------------------------------------------------------------------
+# Disk Cleanup (aggressive / low disk space mode)
+# ------------------------------------------------------------------------------
+
+CLEANMGR /VERYLOWDISK
+
+# ------------------------------------------------------------------------------
+# DNS / network refresh
+# ------------------------------------------------------------------------------
+
+ipconfig /flushdns
+ipconfig /registerdns
+
+# ------------------------------------------------------------------------------
+# Print Spooler reset
+# ------------------------------------------------------------------------------
+
+Stop-Service -Name Spooler -Force
+Remove-Item "C:\Windows\System32\spool\PRINTERS\*.*" -Force -ErrorAction SilentlyContinue
+Start-Service -Name Spooler
+Set-Service -Name Spooler -StartupType Automatic
+
+# ------------------------------------------------------------------------------
+# WMI repository repair + Group Policy refresh
+# ------------------------------------------------------------------------------
+
+Stop-Service -Name winmgmt -Force
+Rename-Item "C:\Windows\System32\wbem\Repository" "Repository.old" -Force -ErrorAction SilentlyContinue
+Start-Service -Name winmgmt
+
+gpupdate /force
+
+# ------------------------------------------------------------------------------
+# Final reboot (5 minute warning)
+# ------------------------------------------------------------------------------
+
+Write-Host "Rebooting computer in 5 minutes..."
+shutdown -r -t 300
+
+# Optional: return to restricted policy after everything
+# Set-ExecutionPolicy -ExecutionPolicy Default -Force
