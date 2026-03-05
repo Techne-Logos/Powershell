@@ -1,0 +1,124 @@
+# Find AP Name: #Requires -Version 5.1
+<#
+.SYNOPSIS
+    Displays the currently connected Meraki Access Point
+    using the master.csv file (Network, Name, MAC)
+#>
+Clear-Host
+# ────────────────────────────────────────────────────────────────
+# 1. Get IP and campus octet
+# ────────────────────────────────────────────────────────────────
+$ip = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+      Where-Object { $_.IPAddress -match '^\d{1,3}(\.\d{1,3}){3}$' -and
+                     $_.IPAddress -notmatch '^(127\.|169\.254\.)' } |
+      Select-Object -ExpandProperty IPAddress -First 1
+if (-not $ip) {
+    Write-Host "Error: No valid IPv4 address found." -ForegroundColor Red
+    exit 1
+}
+$campusCode = $ip.Split('.')[1]
+Write-Host " IP Address : " -NoNewline -ForegroundColor Cyan
+Write-Host $ip -ForegroundColor White
+Write-Host " Campus Octet : " -NoNewline -ForegroundColor Cyan
+Write-Host $campusCode -ForegroundColor White
+# ────────────────────────────────────────────────────────────────
+# 2. Copy master.csv
+# ────────────────────────────────────────────────────────────────
+$networkPath = "\\Zero\technology\local-repository\PC-TOOLS\NETWORK-TOOLS\MERAKI\episd\master.csv"
+$localPath = "$env:TEMP\meraki-ap-list.csv"
+Write-Host " Fetching AP list... " -NoNewline -ForegroundColor Cyan
+try {
+    Copy-Item -Path $networkPath -Destination $localPath -Force -ErrorAction Stop
+    Write-Host "Success" -ForegroundColor Green
+} catch {
+    Write-Host "Failed" -ForegroundColor Red
+    Write-Host " $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+# ────────────────────────────────────────────────────────────────
+# 3. Check Wi-Fi connection
+# ────────────────────────────────────────────────────────────────
+$interfaces = netsh wlan show interfaces
+$stateLine = $interfaces | Select-String "State\s+:\s+(.+)"
+$state = if ($stateLine -and $stateLine.Matches.Groups.Count -ge 2) {
+    $stateLine.Matches.Groups[1].Value.Trim()
+} else { "" }
+if ($state -ne "connected") {
+    Write-Host "`n ERROR: Not connected to Wi-Fi (state: $state)" -ForegroundColor Red
+    Remove-Item $localPath -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+# ────────────────────────────────────────────────────────────────
+# 4. Get BSSID & Signal
+# ────────────────────────────────────────────────────────────────
+$bssidLine = $interfaces | Select-String "BSSID\s+:\s+(.+)"
+$signalLine = $interfaces | Select-String "Signal\s+:\s+(.+)"
+if (-not $bssidLine -or $bssidLine.Matches.Groups.Count -lt 2) {
+    Write-Host " ERROR: Could not read BSSID" -ForegroundColor Red
+    Remove-Item $localPath -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+$BSSID = $bssidLine.Matches.Groups[1].Value.Trim()
+$signal = if ($signalLine -and $signalLine.Matches.Groups.Count -ge 2) {
+    $signalLine.Matches.Groups[1].Value.Trim()
+} else { "N/A" }
+$macParts = $BSSID -split ':'
+$lastTwo = if ($macParts.Count -ge 2) { "$($macParts[-2]):$($macParts[-1])".ToLower() } else { "" }
+Write-Host " Connected BSSID : " -NoNewline -ForegroundColor Cyan
+Write-Host $BSSID -ForegroundColor White
+Write-Host " Last two octets : " -NoNewline -ForegroundColor Cyan
+Write-Host $lastTwo.ToUpper() -ForegroundColor Yellow
+Write-Host " Signal Strength : " -NoNewline -ForegroundColor Cyan
+Write-Host $signal -ForegroundColor White
+# ────────────────────────────────────────────────────────────────
+# 5. Load CSV & find match
+# ────────────────────────────────────────────────────────────────
+try {
+    $apList = Import-Csv -Path $localPath -Encoding UTF8 -ErrorAction Stop
+} catch {
+    Write-Host " ERROR: Failed to read CSV" -ForegroundColor Red
+    Remove-Item $localPath -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+$match = $apList | Where-Object { $_.MAC -and $_.MAC.Trim() -like "*$lastTwo" } | Select-Object -First 1
+# ────────────────────────────────────────────────────────────────
+# 6. Beautiful output
+# ────────────────────────────────────────────────────────────────
+Write-Host "`n" -NoNewline
+Write-Host "╔════════════════════════════════════════════════════════════╗" -ForegroundColor DarkCyan
+Write-Host "║ Connected Meraki Access Point ║" -ForegroundColor Cyan
+Write-Host "╚════════════════════════════════════════════════════════════╝" -ForegroundColor DarkCyan
+if ($match -and $match.MAC) {
+    $name = if ($match.Name -and $match.Name.Trim()) { $match.Name.Trim() } else { "Unnamed AP" }
+    $network = if ($match.Network -and $match.Network.Trim()) { $match.Network.Trim() } else { "Unknown" }
+    $macFull = $match.MAC.Trim()
+    Write-Host ""
+    Write-Host " AP Name " -NoNewline -ForegroundColor Gray
+    Write-Host $name.PadRight(35) -ForegroundColor Green
+    Write-Host " Campus / Network " -NoNewline -ForegroundColor Gray
+    Write-Host $network.PadRight(35) -ForegroundColor White
+    Write-Host " MAC Address " -NoNewline -ForegroundColor Gray
+    Write-Host $macFull.PadRight(35) -ForegroundColor White
+    Write-Host " BSSID (matched) " -NoNewline -ForegroundColor Gray
+    Write-Host $BSSID.PadRight(35) -ForegroundColor Yellow
+    Write-Host " Signal Strength " -NoNewline -ForegroundColor Gray
+    Write-Host $signal.PadRight(35) -ForegroundColor White
+    Write-Host ""
+    Write-Host " Location hint: $network" -ForegroundColor DarkGray
+} else {
+    Write-Host ""
+    Write-Host " No matching AP found for last two octets: " -NoNewline -ForegroundColor Yellow
+    Write-Host $lastTwo.ToUpper() -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host " Possible reasons:" -ForegroundColor DarkYellow
+    Write-Host " • Connected to an unlisted / new AP" -ForegroundColor DarkYellow
+    Write-Host " • master.csv is outdated" -ForegroundColor DarkYellow
+    Write-Host " • Different campus or VLAN" -ForegroundColor DarkYellow
+    Write-Host " • Guest / rogue / hidden AP" -ForegroundColor DarkYellow
+}
+# ────────────────────────────────────────────────────────────────
+# Cleanup
+# ────────────────────────────────────────────────────────────────
+Remove-Item $localPath -Force -ErrorAction SilentlyContinue
+Write-Host "`n Cleanup complete." -ForegroundColor DarkGray
+Write-Host ""
