@@ -1,0 +1,152 @@
+# Generic - Backup running-config from multiple Cisco devices via SSH (Plink)
+# (fully anonymized - no domain, school, or location markers)
+
+$VerbosePreference = "Continue"
+
+# ────────────────────────────────────────────────
+# Configuration - EDIT THESE PATHS AS NEEDED
+# ────────────────────────────────────────────────
+
+# Path to plink.exe (PuTTY's command-line SSH client)
+$plinkPath = "C:\Tools\PuTTY\plink.exe"                 # ←←←  CHANGE THIS
+
+# File containing one IP/hostname per line
+$deviceListFile = "$env:USERPROFILE\Documents\Cisco\devices.txt"   # ←←←  CHANGE THIS or use CSV/parameter
+
+# Where to save the backups
+$outputBaseDir = "$env:USERPROFILE\Documents\Cisco\Backups"        # ←←←  CHANGE THIS
+# Alternative: network share example
+# $outputBaseDir = "\\server\share\CiscoConfigs"
+
+$timeoutSeconds = 15   # per device - adjust based on your network/response time
+
+# ────────────────────────────────────────────────
+# Validate prerequisites
+# ────────────────────────────────────────────────
+if (!(Test-Path $plinkPath)) {
+    Write-Error "plink.exe not found at: $plinkPath"
+    exit 1
+}
+
+if (!(Test-Path $deviceListFile)) {
+    Write-Error "Device list file not found: $deviceListFile"
+    Write-Host "Example content (one IP/hostname per line):"
+    Write-Host "192.168.1.10"
+    Write-Host "core-switch.example.local"
+    exit 1
+}
+
+# Create output folder if missing
+if (!(Test-Path $outputBaseDir -PathType Container)) {
+    Write-Verbose "Creating output directory: $outputBaseDir"
+    New-Item -ItemType Directory -Path $outputBaseDir -Force | Out-Null
+}
+
+# ────────────────────────────────────────────────
+# Get credentials (once - used for all devices)
+# ────────────────────────────────────────────────
+Write-Host "Credentials will be used for ALL devices." -ForegroundColor Cyan
+$username = Read-Host "Enter SSH username"
+$securePass = Read-Host "Enter SSH password" -AsSecureString
+
+# Convert to plain text (Plink requires it)
+$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePass)
+$passwordPlain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+
+# ────────────────────────────────────────────────
+# Read list of devices
+# ────────────────────────────────────────────────
+$devices = Get-Content -Path $deviceListFile |
+           Where-Object { $_ -match '\S' } |    # skip empty lines
+           ForEach-Object { $_.Trim() }
+
+Write-Host "Found $($devices.Count) devices to process." -ForegroundColor Green
+
+# ────────────────────────────────────────────────
+# Process each device
+# ────────────────────────────────────────────────
+foreach ($device in $devices) {
+    Write-Verbose "───────────────────────────────────────────────"
+    Write-Verbose "Processing: $device"
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+    $safeName = $device -replace '[^a-zA-Z0-9.-]', '_'
+    $outputFile = Join-Path $outputBaseDir "$safeName-config_$timestamp.txt"
+
+    $remoteCommands = @"
+enable
+terminal length 0
+show running-config
+exit
+"@
+
+    $plinkArgs = "-ssh -t -pw `"$passwordPlain`" $username@$device"
+
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($plink, $args, $cmds)
+
+            $p = New-Object System.Diagnostics.Process
+            $si = $p.StartInfo
+            $si.FileName               = $plink
+            $si.Arguments              = $args
+            $si.RedirectStandardInput  = $true
+            $si.RedirectStandardOutput = $true
+            $si.RedirectStandardError  = $true
+            $si.UseShellExecute        = $false
+            $si.CreateNoWindow         = $true
+
+            $p.Start() | Out-Null
+
+            $p.StandardInput.Write($cmds)
+            $p.StandardInput.Close()
+
+            $out = $p.StandardOutput.ReadToEnd()
+            $err = $p.StandardError.ReadToEnd()
+
+            $p.WaitForExit(10000)  # extra safety
+
+            return @{ Output = $out; Error = $err; ExitCode = $p.ExitCode }
+        } -ArgumentList $plinkPath, $plinkArgs, $remoteCommands
+
+        Write-Verbose "Waiting up to $timeoutSeconds sec..."
+        $completed = Wait-Job -Job $job -Timeout $timeoutSeconds
+
+        if ($completed) {
+            $result = Receive-Job -Job $job -AutoRemoveJob
+
+            if ($result.ExitCode -eq 0 -and $result.Output.Length -gt 200) {
+                Set-Content -Path $outputFile -Value $result.Output -Force -Encoding UTF8
+                Write-Host "Success: $device → $outputFile" -ForegroundColor Green
+            }
+            elseif ($result.Error -match "Connection refused|No route|unreachable") {
+                Write-Warning "Connection failed: $device (refused / unreachable)"
+            }
+            elseif ($result.Error -match "denied|failed|incorrect|invalid") {
+                Write-Warning "Authentication failed: $device"
+            }
+            else {
+                Write-Warning "Failed: $device (exit $($result.ExitCode))"
+                Write-Verbose "Error snippet: $($result.Error -replace '\r?\n',' ' -replace '\s+',' ')"
+            }
+        }
+        else {
+            Write-Warning "Timeout after $timeoutSeconds sec: $device"
+            Stop-Job $job -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        Write-Warning "Exception on $device : $_"
+    }
+    finally {
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host "`nProcessing complete." -ForegroundColor Cyan
+Write-Host "Credentials have been cleared from memory (best effort)."
+
+# Security note: plain password variable is nulled below (not perfect but helps)
+$passwordPlain = $null
+[GC]::Collect()
