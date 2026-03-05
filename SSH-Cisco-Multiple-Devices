@@ -1,5 +1,4 @@
-# Generic - Backup running-config from multiple Cisco devices via SSH (Plink)
-# (fully anonymized - no domain, school, or location markers)
+# Backup running-config from multiple Cisco devices via SSH (Plink)
 
 $VerbosePreference = "Continue"
 
