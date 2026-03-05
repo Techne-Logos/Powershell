@@ -1,0 +1,124 @@
+# Generic Cisco device configuration backup via SSH using Plink
+# (anonymized version - no company/school/domain markers)
+
+$VerbosePreference = "Continue"
+
+Write-Verbose "Starting SSH configuration backup script..."
+
+# ────────────────────────────────────────────────
+# Collect connection details (user input)
+# ────────────────────────────────────────────────
+$sshServer   = Read-Host "Enter target device IP or hostname"
+$sshUsername = Read-Host "Enter SSH username"
+$sshPassword = Read-Host "Enter SSH password" -AsSecureString
+
+# Convert secure string → plain text (required for plink -pw)
+$ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sshPassword)
+$plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr)
+[System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)   # Attempt to clean memory
+
+# ────────────────────────────────────────────────
+# Plink.exe location – change this to match your environment
+# ────────────────────────────────────────────────
+$plinkPath = "C:\Tools\PuTTY\plink.exe"           # ←←←  EDIT THIS PATH
+
+# You can also detect it automatically like this (optional):
+# $plinkPath = (Get-Command plink -ErrorAction SilentlyContinue)?.Source
+# if (!$plinkPath) { $plinkPath = "C:\Program Files\PuTTY\plink.exe" }
+
+if (!(Test-Path $plinkPath)) {
+    Write-Error "plink.exe not found at: $plinkPath"
+    exit
+}
+
+# ────────────────────────────────────────────────
+# Where to save the configurations
+# ────────────────────────────────────────────────
+# Option A: Local folder (recommended for most standalone use)
+$outputBaseDir = "$env:USERPROFILE\Documents\Cisco-Configs"
+
+# Option B: Network share (uncomment and modify if needed)
+# $outputBaseDir = "\\server\share\Cisco-Backups"
+
+# Create folder if it doesn't exist
+if (!(Test-Path $outputBaseDir -PathType Container)) {
+    Write-Verbose "Creating output directory: $outputBaseDir"
+    New-Item -ItemType Directory -Path $outputBaseDir -Force | Out-Null
+}
+
+# Output filename = hostname-or-ip.txt
+$outputFile = Join-Path $outputBaseDir "$sshServer.txt"
+
+Write-Verbose "Configuration will be saved to: $outputFile"
+
+# ────────────────────────────────────────────────
+# Commands to run on the Cisco device
+# ────────────────────────────────────────────────
+$commands = @"
+enable
+term len 0
+show running-config
+exit
+"@
+
+# ────────────────────────────────────────────────
+# Build plink arguments
+# ────────────────────────────────────────────────
+$plinkArgs = "-ssh -t -v -pw `"$plainPassword`" $sshUsername@$sshServer"
+
+Write-Verbose "Plink arguments prepared."
+
+# ────────────────────────────────────────────────
+# Execute Plink and capture output
+# ────────────────────────────────────────────────
+try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = $plinkPath
+    $psi.Arguments              = $plinkArgs
+    $psi.RedirectStandardInput  = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.UseShellExecute        = $false
+    $psi.CreateNoWindow         = $true
+
+    $process = [System.Diagnostics.Process]::Start($psi)
+
+    # Send commands
+    $process.StandardInput.Write($commands)
+    $process.StandardInput.Close()
+
+    # Read output
+    $output = $process.StandardOutput.ReadToEnd()
+    $errorOutput = $process.StandardError.ReadToEnd()
+
+    $process.WaitForExit()
+
+    if ($process.ExitCode -ne 0) {
+        Write-Warning "Plink exited with code $($process.ExitCode)"
+        if ($errorOutput) {
+            Write-Host "Plink error output:" -ForegroundColor Yellow
+            Write-Host $errorOutput -ForegroundColor Yellow
+        }
+    }
+
+    # Save captured configuration
+    Set-Content -Path $outputFile -Value $output -Force -Encoding UTF8
+    Write-Host "Configuration saved to: $outputFile" -ForegroundColor Green
+
+}
+catch {
+    Write-Host "Error during SSH session: $_" -ForegroundColor Red
+}
+finally {
+    # Clean up process
+    if ($process -and !$process.HasExited) {
+        try { $process.Kill() } catch {}
+    }
+
+    # Clear sensitive variable from memory (best effort)
+    $plainPassword = $null
+    $commands = $null
+    [GC]::Collect()
+}
+
+Write-Verbose "Script finished."
