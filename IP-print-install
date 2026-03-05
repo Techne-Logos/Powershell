@@ -1,0 +1,104 @@
+# Generic - Install Ricoh Universal PCL6 printer (or similar network printer)
+# (fully anonymized - no domain, school, location, or specific identifiers)
+
+# ────────────────────────────────────────────────
+# Configuration - EDIT THESE VALUES AS NEEDED
+# ────────────────────────────────────────────────
+
+# Local folder where driver files will be extracted/copied
+$localDriverFolder = "C:\Temp\PrinterDrivers\Ricoh-Uni-64"
+
+# Source path for driver files (network share, USB, etc.)
+# Examples:
+#   - Network: "\\server\share\Drivers\Ricoh\64bit"
+#   - Local/USB: "D:\Drivers\Ricoh-Uni-64"
+$sourceDriverPath = "\\server\share\PrinterDrivers\Ricoh\64bit"   # ←←← CHANGE THIS
+
+# Printer TCP/IP port settings
+$printerIP         = "10.10.10.50"               # ←←← CHANGE THIS (printer IP)
+$portName          = "IP_$printerIP"             # Auto-generated or customize
+$portNumber        = 9100                        # Standard raw port for most network printers
+
+# Printer & driver details (match your .inf file)
+$infFileName       = "oemsetup.inf"              # Common for Ricoh universal drivers
+$driverName        = "PCL6 Driver for Universal Print"   # ←←← Confirm exact name from .inf
+$printerName       = "Library-Ricoh-MFP"         # ←←← Change to desired printer name
+
+# ────────────────────────────────────────────────
+# Create local folder & copy driver files
+# ────────────────────────────────────────────────
+if (!(Test-Path $localDriverFolder -PathType Container)) {
+    Write-Host "Creating local driver folder: $localDriverFolder"
+    New-Item -Path $localDriverFolder -ItemType Directory -Force | Out-Null
+}
+
+Write-Host "Copying driver files from $sourceDriverPath ..."
+Copy-Item -Path "$sourceDriverPath\*" -Destination $localDriverFolder -Recurse -Force
+
+$infPath = Join-Path $localDriverFolder $infFileName
+
+if (!(Test-Path $infPath)) {
+    Write-Error "INF file not found: $infPath"
+    Write-Host "Check that driver files were copied correctly."
+    exit
+}
+
+# ────────────────────────────────────────────────
+# Add TCP/IP printer port (if missing)
+# ────────────────────────────────────────────────
+if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) {
+    Write-Host "Adding printer port: $portName ($printerIP)"
+    try {
+        Add-PrinterPort -Name $portName -PrinterHostAddress $printerIP -PortNumber $portNumber
+    }
+    catch {
+        Write-Error "Failed to create printer port: $_"
+        exit
+    }
+}
+else {
+    Write-Host "Port $portName already exists."
+}
+
+# ────────────────────────────────────────────────
+# Install printer driver (if not already present)
+# ────────────────────────────────────────────────
+$existingDriver = Get-PrinterDriver -Name $driverName -ErrorAction SilentlyContinue
+
+if (-not $existingDriver) {
+    Write-Host "Installing driver: $driverName"
+    try {
+        Add-PrinterDriver -Name $driverName -InfPath $infPath
+        Write-Host "Driver installed successfully."
+    }
+    catch {
+        Write-Error "Failed to install driver: $_"
+        Write-Host "Common causes: wrong INF path, driver already exists under different name, or architecture mismatch."
+        exit
+    }
+}
+else {
+    Write-Host "Driver '$driverName' is already installed."
+}
+
+# ────────────────────────────────────────────────
+# Add the printer (if it doesn't exist)
+# ────────────────────────────────────────────────
+if (-not (Get-Printer -Name $printerName -ErrorAction SilentlyContinue)) {
+    Write-Host "Creating printer: $printerName"
+    try {
+        Add-Printer -Name $printerName -DriverName $driverName -PortName $portName
+        Write-Host "Printer '$printerName' created successfully." -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Failed to create printer: $_"
+    }
+}
+else {
+    Write-Host "Printer '$printerName' already exists."
+}
+
+# Optional: Set as default printer (uncomment if desired)
+# (Get-Printer -Name $printerName).SetDefaultPrinter()
+
+Write-Host "`nPrinter installation complete." -ForegroundColor Cyan
