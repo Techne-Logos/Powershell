@@ -1,0 +1,172 @@
+# Generic - Windows Server Backup to one or more network shares
+# (fully anonymized - no domain, school, location, or specific server names)
+
+# ────────────────────────────────────────────────
+# Configuration - EDIT THESE VALUES AS NEEDED
+# ────────────────────────────────────────────────
+
+# List of backup destination UNC paths
+# Examples:
+#   - "\\backup-server\backups$\servers"
+#   - "\\192.168.10.50\Backups\DC"
+#   - "\\nas01\ServerBackups"
+$NetworkShares = @(
+    "\\backup-server\backups$\servers"          # ←←← CHANGE or ADD destinations
+    # "\\192.168.10.51\ServerBackups",
+    # "\\nas\share\DailyServerBackups"
+)
+
+# Volumes to back up (comma-separated if multiple)
+$VolumesToBackup = "C:"                         # ←←← Add more like "C:,D:,E:" if needed
+
+# How many complete (intact) backups to keep per destination
+$KeepLatestIntact = 1                           # Usually 1 = only the most recent good one
+
+# Optional: custom backup folder name prefix (defaults to computer name)
+$BackupFolderPrefix = $env:COMPUTERNAME         # Or set to something like "Server01"
+
+# ────────────────────────────────────────────────
+# Script begins
+# ────────────────────────────────────────────────
+
+$CurrentDate = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+
+Write-Host "Starting Windows Server Backup script..." -ForegroundColor Cyan
+Write-Host "Keeping up to $KeepLatestIntact intact backup(s) per destination"
+Write-Host "Target volumes: $VolumesToBackup`n"
+
+foreach ($NetworkShare in $NetworkShares) {
+    $NetworkShare = $NetworkShare.TrimEnd('\')
+
+    # Extract short destination name for folder naming & self-check
+    $DestinationServer = if ($NetworkShare -match '^\\\\([^\\]+)\\') { $Matches[1] } else { "unknown" }
+
+    # Skip if backing up to self (basic check)
+    if ($DestinationServer -and $DestinationServer -ieq $env:COMPUTERNAME) {
+        Write-Host "Skipping $NetworkShare (appears to be this server)" -ForegroundColor Yellow
+        continue
+    }
+
+    Write-Host "`n=== Destination: $NetworkShare ===" -ForegroundColor Magenta
+
+    # Test access
+    if (-not (Test-Path $NetworkShare -ErrorAction SilentlyContinue)) {
+        Write-Host "Cannot reach $NetworkShare → skipping" -ForegroundColor Red
+        continue
+    }
+
+    # Pattern for folders this script creates: PREFIX-YYYY-MM-DD_HH-mm-ss
+    $BackupPattern = "^$([regex]::Escape($BackupFolderPrefix))-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$"
+
+    # Find existing backups created by this script
+    $ExistingBackups = Get-ChildItem -Path $NetworkShare -Directory -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Name -match $BackupPattern } |
+                       Sort-Object CreationTime -Descending
+
+    $Intact   = @()
+    $Corrupt  = @()
+
+    if ($ExistingBackups.Count -gt 0) {
+        Write-Host "Found $($ExistingBackups.Count) previous backup folder(s). Checking:" -ForegroundColor Cyan
+
+        foreach ($b in $ExistingBackups) {
+            $wib = Join-Path $b.FullName "WindowsImageBackup"
+            $cat  = Join-Path $b.FullName "Catalogs\GlobalCatalog.wbcat"
+
+            $hasData = Test-Path (Join-Path $wib "*") -ErrorAction SilentlyContinue
+
+            if ((Test-Path $wib) -and (Test-Path $cat) -and $hasData) {
+                Write-Host "  $($b.Name) → INTACT" -ForegroundColor Green
+                $Intact += $b
+            } else {
+                Write-Host "  $($b.Name) → INCOMPLETE / corrupted" -ForegroundColor Yellow
+                $Corrupt += $b
+            }
+        }
+
+        # Clean up incomplete first
+        foreach ($bad in $Corrupt) {
+            Write-Host "Removing incomplete: $($bad.Name)" -ForegroundColor Yellow
+            Remove-Item -Path $bad.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path $bad.FullName) {
+                Write-Host "  Delete failed" -ForegroundColor Red
+            } else {
+                Write-Host "  Deleted" -ForegroundColor Gray
+            }
+        }
+
+        # Keep only the newest $KeepLatestIntact intact backups
+        if ($Intact.Count -gt $KeepLatestIntact) {
+            $toDelete = $Intact | Select-Object -Skip $KeepLatestIntact
+            foreach ($old in $toDelete) {
+                Write-Host "Removing old intact backup: $($old.Name)" -ForegroundColor Yellow
+                Remove-Item -Path $old.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                if (Test-Path $old.FullName) {
+                    Write-Host "  Delete failed" -ForegroundColor Red
+                } else {
+                    Write-Host "  Deleted" -ForegroundColor Gray
+                }
+            }
+            $keepers = $Intact | Select-Object -First $KeepLatestIntact
+        } else {
+            $keepers = $Intact
+        }
+
+        if ($keepers) {
+            Write-Host "Keeping:" -ForegroundColor Green
+            $keepers | ForEach-Object { Write-Host "  - $($_.Name)" -ForegroundColor Gray }
+        } else {
+            Write-Host "No intact backups remain after cleanup." -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host "No previous backups found at this location." -ForegroundColor Cyan
+    }
+
+    # Create new backup folder
+    $NewBackupFolder = Join-Path $NetworkShare "$BackupFolderPrefix-$CurrentDate"
+
+    Write-Host "Creating: $NewBackupFolder" -ForegroundColor Cyan
+    try {
+        New-Item -Path $NewBackupFolder -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    }
+    catch {
+        Write-Host "Failed to create folder: $_" -ForegroundColor Red
+        continue
+    }
+
+    # Ensure Windows Server Backup feature is available
+    if (-not (Get-WindowsFeature -Name Windows-Server-Backup -ErrorAction SilentlyContinue).Installed) {
+        Write-Host "Installing Windows-Server-Backup feature..." -ForegroundColor Yellow
+        try {
+            Install-WindowsFeature -Name Windows-Server-Backup -IncludeManagementTools -ErrorAction Stop | Out-Null
+            Write-Host "Feature installed." -ForegroundColor Green
+        }
+        catch {
+            Write-Host "Failed to install feature: $_" -ForegroundColor Red
+            continue
+        }
+    }
+
+    # Perform backup
+    Write-Host "Starting backup of $VolumesToBackup ..." -ForegroundColor Cyan
+    try {
+        $policy = New-WBPolicy
+        $volumes = $VolumesToBackup -split ',' | ForEach-Object { Get-WBVolume -VolumePath $_.Trim() }
+        Add-WBVolume -Policy $policy -Volume $volumes
+
+        $target = New-WBBackupTarget -NetworkPath $NewBackupFolder
+        Add-WBBackupTarget -Policy $policy -Target $target -ErrorAction Stop
+
+        Start-WBBackup -Policy $policy -Force -ErrorAction Stop
+
+        Write-Host "Backup completed successfully!" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Backup failed: $_" -ForegroundColor Red
+        # Optional: remove failed folder?
+        # Remove-Item $NewBackupFolder -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host "`nBackup script finished." -ForegroundColor Magenta
