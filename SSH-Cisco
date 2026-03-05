@@ -1,5 +1,4 @@
-# Generic Cisco device configuration backup via SSH using Plink
-# (anonymized version - no company/school/domain markers)
+# Cisco device configuration backup via SSH using Plink
 
 $VerbosePreference = "Continue"
 
