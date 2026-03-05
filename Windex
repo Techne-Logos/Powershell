@@ -1,4 +1,4 @@
-# Windex - Main cleanup / maintenance script (generic version)
+# Windex - Main cleanup / maintenance script
 
 Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Force
 
