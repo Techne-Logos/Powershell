@@ -1,5 +1,5 @@
-# Generic - Nutanix Cluster Health Check via SSH (using Plink)
-# (fully anonymized - no domain, school, location, or specific paths)
+# Nutanix Cluster Health Check via SSH (using Plink)
+
 
 $VerbosePreference = "Continue"
 
